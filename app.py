@@ -1,38 +1,32 @@
-import json
-import joblib
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import plotly.express as px
 
-st.set_page_config(page_title="Cash Sales Velocity - Prediction", layout="wide")
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import StratifiedKFold
+
+import lightgbm as lgb
+
+# =========================
+# Page
+# =========================
+st.set_page_config(page_title="Cash Sales Velocity — Prediction", layout="wide")
 st.title("Cash Sales Velocity — Prediction Dashboard")
-st.caption("Predict probability of selling within ≤30 days / ≤60 days based on pricing multiple + property context.")
+st.caption("This app trains the model on startup (cached) and predicts P(sell ≤30d) and P(sell ≤60d). No model files needed.")
 
-# -----------------------------
-# Paths (repo layout)
-# -----------------------------
-DATA_PATH = "data/ai_stats_clean_for_velocity.csv"
-CAL30_PATH = "artifacts/cal30.pkl"
-CAL60_PATH = "artifacts/cal60.pkl"
-FEATURES_PATH = "artifacts/features.json"
+DATA_PATH = "ai_stats_clean_for_velocity.csv"  # file in same repo as app.py
 
-# -----------------------------
-# Load artifacts
-# -----------------------------
-@st.cache_resource
-def load_models():
-    cal30 = joblib.load(CAL30_PATH)
-    cal60 = joblib.load(CAL60_PATH)
-    with open(FEATURES_PATH, "r") as f:
-        meta = json.load(f)
-    return cal30, cal60, meta
-
+# =========================
+# Load + prepare data
+# =========================
 @st.cache_data
-def load_reference_data():
-    df = pd.read_csv(DATA_PATH)
+def load_data(path):
+    df = pd.read_csv(path)
 
-    # parse / standardize
+    # basic columns
     df["PURCHASE DATE"] = pd.to_datetime(df["PURCHASE DATE"], errors="coerce")
     df["SALE DATE - start"] = pd.to_datetime(df["SALE DATE - start"], errors="coerce")
 
@@ -43,134 +37,188 @@ def load_reference_data():
     df["days_to_sale"] = (df["SALE DATE - start"] - df["PURCHASE DATE"]).dt.days
     df["multiple"] = df["sale_price"] / df["total_cost"]
 
-    df["County, State"] = df["County, State"].fillna("Unknown")
-    df["Property Location or City"] = df["Property Location or City"].fillna("Unknown")
+    df["county_state"] = df["County, State"].fillna("Unknown").astype(str)
+    df["city"] = df["Property Location or City"].fillna("Unknown").astype(str)
 
-    # filter basic
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=["days_to_sale", "multiple", "total_cost", "sale_price"])
     df = df[df["days_to_sale"] >= 0].copy()
 
-    # aggregates that were used in training
-    df["county_avg_days"] = df.groupby("County, State")["days_to_sale"].transform("mean")
-    df["city_avg_days"] = df.groupby("Property Location or City")["days_to_sale"].transform("mean")
-    df["county_count"] = df.groupby("County, State")["days_to_sale"].transform("count")
-    df["city_count"] = df.groupby("Property Location or City")["days_to_sale"].transform("count")
+    # targets
+    df["sell_30d"] = (df["days_to_sale"] <= 30).astype(int)
+    df["sell_60d"] = (df["days_to_sale"] <= 60).astype(int)
 
-    # Create lookup tables for Streamlit runtime
-    county_stats = df.groupby("County, State").agg(
-        county_avg_days=("days_to_sale", "mean"),
-        county_count=("days_to_sale", "count")
-    ).reset_index()
+    # feature engineering (numeric-only so LightGBM is happy)
+    df["log_cost"] = np.log1p(df["total_cost"])
+    df["sale_price_implied"] = df["multiple"] * df["total_cost"]
+    df["cost_per_acre"] = df["total_cost"] / df["acres"].replace(0, np.nan)
+    df["sale_per_acre"] = df["sale_price_implied"] / df["acres"].replace(0, np.nan)
+    df["profit_pct"] = (df["sale_price_implied"] - df["total_cost"]) / df["total_cost"]
 
-    city_stats = df.groupby("Property Location or City").agg(
-        city_avg_days=("days_to_sale", "mean"),
-        city_count=("days_to_sale", "count")
-    ).reset_index()
+    # frequency encoding for categories (turn text into numeric)
+    county_freq = df["county_state"].value_counts(normalize=True)
+    city_freq = df["city"].value_counts(normalize=True)
+    df["county_freq"] = df["county_state"].map(county_freq).fillna(0.0)
+    df["city_freq"] = df["city"].map(city_freq).fillna(0.0)
 
-    # global fallback values if a county/city isn't in history
-    global_avg_days = float(df["days_to_sale"].mean())
-    global_count = int(df.shape[0])
+    # county/city historical speed (numeric aggregates)
+    county_avg = df.groupby("county_state")["days_to_sale"].mean()
+    city_avg = df.groupby("city")["days_to_sale"].mean()
+    df["county_avg_days"] = df["county_state"].map(county_avg).fillna(df["days_to_sale"].mean())
+    df["city_avg_days"] = df["city"].map(city_avg).fillna(df["days_to_sale"].mean())
 
-    return df, county_stats, city_stats, global_avg_days, global_count
+    # fill numeric NaNs
+    num_cols = [
+        "multiple","log_cost","acres","cost_per_acre","sale_per_acre","profit_pct",
+        "county_freq","city_freq","county_avg_days","city_avg_days"
+    ]
+    df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+    df[num_cols] = df[num_cols].fillna(0)
 
-cal30, cal60, meta = load_models()
-FEATURES = meta["features"]
+    features = num_cols
+    return df, features, county_freq, city_freq, county_avg, city_avg, float(df["days_to_sale"].mean())
 
-df_ref, county_stats, city_stats, global_avg_days, global_count = load_reference_data()
+df, FEATURES, county_freq, city_freq, county_avg, city_avg, global_avg_days = load_data(DATA_PATH)
 
-county_list = sorted(df_ref["County, State"].dropna().unique().tolist())
-city_list = sorted(df_ref["Property Location or City"].dropna().unique().tolist())
+# =========================
+# Train models (cached)
+# =========================
+@st.cache_resource
+def train_models(df, features):
+    X = df[features].copy()
 
-# -----------------------------
-# Feature engineering (MUST match training)
-# -----------------------------
-def build_features(county_state, city, acres, total_cost, multiple):
-    acres = float(acres)
+    # time split: last 20% test by purchase date
+    df_sorted = df.sort_values("PURCHASE DATE").reset_index(drop=True)
+    X = df_sorted[features].copy()
+    y30 = df_sorted["sell_30d"].values
+    y60 = df_sorted["sell_60d"].values
+
+    split = int(len(df_sorted) * 0.80)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y30_train, y30_test = y30[:split], y30[split:]
+    y60_train, y60_test = y60[:split], y60[split:]
+
+    def fit_calibrated(Xtr, ytr, Xte, yte, seed=42):
+        pos = ytr.mean()
+        spw = (1 - pos) / max(pos, 1e-6)
+
+        base = lgb.LGBMClassifier(
+            n_estimators=3000,
+            learning_rate=0.03,
+            num_leaves=64,
+            min_child_samples=30,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.2,
+            reg_lambda=0.6,
+            random_state=seed,
+            n_jobs=-1,
+            scale_pos_weight=spw
+        )
+
+        base.fit(
+            Xtr, ytr,
+            eval_set=[(Xte, yte)],
+            eval_metric="auc",
+            callbacks=[lgb.early_stopping(200, verbose=False)]
+        )
+
+        cal = CalibratedClassifierCV(
+            estimator=base,
+            method="sigmoid",
+            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+        )
+        cal.fit(Xtr, ytr)
+
+        p = cal.predict_proba(Xte)[:, 1]
+        metrics = {
+            "AUC": float(roc_auc_score(yte, p)),
+            "AP": float(average_precision_score(yte, p)),
+            "Brier": float(brier_score_loss(yte, p)),
+            "base_rate": float(yte.mean())
+        }
+        return cal, metrics
+
+    cal30, m30 = fit_calibrated(X_train, y30_train, X_test, y30_test, seed=42)
+    cal60, m60 = fit_calibrated(X_train, y60_train, X_test, y60_test, seed=43)
+
+    return cal30, cal60, m30, m60
+
+cal30, cal60, m30, m60 = train_models(df, FEATURES)
+
+# =========================
+# Show model metrics
+# =========================
+st.subheader("Model performance (holdout last 20%)")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("≤30d AUC", f"{m30['AUC']:.3f}")
+c2.metric("≤30d AP", f"{m30['AP']:.3f}")
+c3.metric("≤60d AUC", f"{m60['AUC']:.3f}")
+c4.metric("≤60d AP", f"{m60['AP']:.3f}")
+
+st.divider()
+
+# =========================
+# Sidebar inputs
+# =========================
+st.sidebar.header("Property Inputs")
+
+county_options = sorted(df["county_state"].unique())
+city_options = sorted(df["city"].unique())
+
+county_state = st.sidebar.selectbox("County, State", county_options, index=0)
+city = st.sidebar.selectbox("City", city_options, index=0)
+
+acres = st.sidebar.number_input("Acres", min_value=0.0, value=2.5, step=0.1)
+total_cost = st.sidebar.number_input("Total Purchase Price (Cost)", min_value=100.0, value=6000.0, step=100.0)
+
+st.sidebar.subheader("Pricing Scan (multiple)")
+m_min = st.sidebar.number_input("Min multiple", min_value=0.5, value=1.5, step=0.1)
+m_max = st.sidebar.number_input("Max multiple", min_value=0.6, value=6.0, step=0.1)
+m_step = st.sidebar.number_input("Step", min_value=0.05, value=0.1, step=0.05)
+
+target_p60 = st.sidebar.slider("Target P(sell ≤60d)", 0.0, 1.0, 0.70, 0.01)
+target_p30 = st.sidebar.slider("Target P(sell ≤30d)", 0.0, 1.0, 0.60, 0.01)
+enforce_30 = st.sidebar.checkbox("Also enforce ≤30d target", value=False)
+
+# =========================
+# Build prediction rows
+# =========================
+def make_features(county_state, city, acres, total_cost, multiple):
     total_cost = float(total_cost)
+    acres = float(acres)
     multiple = float(multiple)
 
-    # derived money values
     sale_price = multiple * total_cost
 
     log_cost = np.log1p(total_cost)
     cost_per_acre = total_cost / (acres if acres > 0 else np.nan)
     sale_per_acre = sale_price / (acres if acres > 0 else np.nan)
-    profit_pct = (sale_price - total_cost) / total_cost if total_cost > 0 else np.nan
+    profit_pct = (sale_price - total_cost) / total_cost if total_cost > 0 else 0.0
 
-    # lookup county/city aggregates
-    c_row = county_stats[county_stats["County, State"] == county_state]
-    if len(c_row):
-        county_avg_days = float(c_row["county_avg_days"].iloc[0])
-        county_count = int(c_row["county_count"].iloc[0])
-    else:
-        county_avg_days = global_avg_days
-        county_count = 0
+    county_f = float(county_freq.get(county_state, 0.0))
+    city_f = float(city_freq.get(city, 0.0))
 
-    ct_row = city_stats[city_stats["Property Location or City"] == city]
-    if len(ct_row):
-        city_avg_days = float(ct_row["city_avg_days"].iloc[0])
-        city_count = int(ct_row["city_count"].iloc[0])
-    else:
-        city_avg_days = global_avg_days
-        city_count = 0
+    county_avg_days_val = float(county_avg.get(county_state, global_avg_days))
+    city_avg_days_val = float(city_avg.get(city, global_avg_days))
 
-    # month is unknown at prediction time → let user choose it
-    # (handled outside)
-    return {
+    row = {
         "multiple": multiple,
         "log_cost": log_cost,
         "acres": acres,
-        "cost_per_acre": cost_per_acre,
-        "sale_per_acre": sale_per_acre,
-        "profit_pct": profit_pct,
-        "county_avg_days": county_avg_days,
-        "city_avg_days": city_avg_days,
-        "county_count": county_count,
-        "city_count": city_count,
+        "cost_per_acre": 0.0 if np.isnan(cost_per_acre) else float(cost_per_acre),
+        "sale_per_acre": 0.0 if np.isnan(sale_per_acre) else float(sale_per_acre),
+        "profit_pct": float(profit_pct),
+        "county_freq": county_f,
+        "city_freq": city_f,
+        "county_avg_days": county_avg_days_val,
+        "city_avg_days": city_avg_days_val,
     }
+    return row
 
-# -----------------------------
-# Sidebar inputs
-# -----------------------------
-st.sidebar.header("Property Inputs")
-
-county_state = st.sidebar.selectbox("County, State", options=county_list, index=0)
-city = st.sidebar.selectbox("City", options=city_list, index=0)
-
-acres = st.sidebar.number_input("Acres", min_value=0.0, value=2.5, step=0.1)
-total_cost = st.sidebar.number_input("Total Purchase Price (Cost)", min_value=100.0, value=6000.0, step=100.0)
-
-purchase_month = st.sidebar.slider("Purchase month (1–12)", 1, 12, 10)
-
-st.sidebar.subheader("Pricing Scan (Multiple)")
-m_min = st.sidebar.number_input("Min multiple", min_value=0.5, value=1.5, step=0.1)
-m_max = st.sidebar.number_input("Max multiple", min_value=0.6, value=6.0, step=0.1)
-m_step = st.sidebar.number_input("Step", min_value=0.05, value=0.1, step=0.05)
-
-st.sidebar.subheader("Decision Targets")
-target_p60 = st.sidebar.slider("Target P(sell ≤60d)", 0.0, 1.0, 0.60, 0.01)
-target_p30 = st.sidebar.slider("Target P(sell ≤30d)", 0.0, 1.0, 0.45, 0.01)
-use_30_constraint = st.sidebar.checkbox("Also enforce 30-day target", value=False)
-
-# -----------------------------
-# Prediction scan
-# -----------------------------
 multiples = np.arange(m_min, m_max + 1e-9, m_step)
-
-rows = []
-for m in multiples:
-    feats = build_features(county_state, city, acres, total_cost, m)
-    feats["purchase_month"] = int(purchase_month)
-    rows.append(feats)
-
-X_scan = pd.DataFrame(rows)
-
-# Ensure same column order as training
-for col in FEATURES:
-    if col not in X_scan.columns:
-        X_scan[col] = np.nan
-X_scan = X_scan[FEATURES].fillna(0)
+rows = [make_features(county_state, city, acres, total_cost, m) for m in multiples]
+X_scan = pd.DataFrame(rows)[FEATURES].fillna(0)
 
 p30 = cal30.predict_proba(X_scan)[:, 1]
 p60 = cal60.predict_proba(X_scan)[:, 1]
@@ -179,63 +227,43 @@ pred = pd.DataFrame({
     "multiple": multiples,
     "sale_price_est": multiples * float(total_cost),
     "P_sell_30d": p30,
-    "P_sell_60d": p60,
+    "P_sell_60d": p60
 })
 
-# -----------------------------
-# Recommend best multiple under constraints
-# -----------------------------
+# Recommendation
 mask = pred["P_sell_60d"] >= target_p60
-if use_30_constraint:
+if enforce_30:
     mask &= pred["P_sell_30d"] >= target_p30
 
 feasible = pred[mask].copy()
 rec = feasible.sort_values("multiple").iloc[-1] if len(feasible) else None
 
-# -----------------------------
-# KPIs
-# -----------------------------
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Cost", f"${total_cost:,.0f}")
-c2.metric("Acres", f"{acres:,.2f}")
-c3.metric("County avg days (history)", f"{build_features(county_state, city, acres, total_cost, m_min)['county_avg_days']:.1f}")
-c4.metric("City avg days (history)", f"{build_features(county_state, city, acres, total_cost, m_min)['city_avg_days']:.1f}")
-
-st.divider()
+# =========================
+# Output
+# =========================
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Cost", f"${total_cost:,.0f}")
+k2.metric("Acres", f"{acres:,.2f}")
+k3.metric("County avg days", f"{float(county_avg.get(county_state, global_avg_days)):.1f}")
+k4.metric("City avg days", f"{float(city_avg.get(city, global_avg_days)):.1f}")
 
 if rec is None:
-    st.warning("No pricing multiple meets your probability target(s) in this scan range. Try lowering targets or scanning lower multiples.")
+    st.warning("No multiple in your scan meets the probability target(s). Try lowering targets or scanning lower multiples.")
 else:
     st.success(
-        f"Recommended max multiple: **{rec['multiple']:.2f}x** "
+        f"Recommended MAX multiple: **{rec['multiple']:.2f}x** "
         f"(sale ≈ **${rec['sale_price_est']:,.0f}**) "
         f"| P30=**{rec['P_sell_30d']:.2f}** P60=**{rec['P_sell_60d']:.2f}**"
     )
 
-# -----------------------------
-# Plots
-# -----------------------------
 left, right = st.columns(2)
-
 with left:
-    fig = px.line(
-        pred,
-        x="multiple",
-        y="P_sell_60d",
-        title="P(sell ≤60 days) vs multiple",
-        labels={"multiple": "Markup multiple", "P_sell_60d": "Probability"},
-    )
+    fig = px.line(pred, x="multiple", y="P_sell_60d", title="P(sell ≤60d) vs multiple")
     fig.update_yaxes(range=[0, 1])
     st.plotly_chart(fig, use_container_width=True)
 
 with right:
-    fig = px.line(
-        pred,
-        x="multiple",
-        y="P_sell_30d",
-        title="P(sell ≤30 days) vs multiple",
-        labels={"multiple": "Markup multiple", "P_sell_30d": "Probability"},
-    )
+    fig = px.line(pred, x="multiple", y="P_sell_30d", title="P(sell ≤30d) vs multiple")
     fig.update_yaxes(range=[0, 1])
     st.plotly_chart(fig, use_container_width=True)
 
@@ -247,9 +275,4 @@ st.download_button(
     data=pred.to_csv(index=False).encode("utf-8"),
     file_name="prediction_scan.csv",
     mime="text/csv",
-)
-
-st.caption(
-    "These are probabilistic predictions for pricing guidance (not guarantees). "
-    "Model uses historical patterns (location speed averages + economics + pricing multiple)."
 )
