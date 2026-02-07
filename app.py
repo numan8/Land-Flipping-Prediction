@@ -1,70 +1,83 @@
-import os, re, json, hashlib
+import os, re, json
 import requests, joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-# -----------------------------
-# Page setup (modern UI)
-# -----------------------------
-st.set_page_config(page_title="Pricing Decision Engine", layout="wide")
-
-st.markdown("""
-<style>
-/* Background */
-.stApp {
-  background: radial-gradient(1200px 600px at 20% -10%, rgba(99,102,241,0.20), transparent 55%),
-              radial-gradient(1200px 600px at 85% 0%, rgba(14,165,233,0.18), transparent 55%),
-              linear-gradient(180deg, #f8fafc 0%, #eef2ff 55%, #f8fafc 100%);
-}
-
-/* Title */
-h1, h2, h3 { letter-spacing: -0.02em; }
-
-/* Cards */
-.card {
-  background: rgba(255,255,255,0.75);
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  box-shadow: 0 10px 30px rgba(2, 6, 23, 0.06);
-  border-radius: 18px;
-  padding: 16px 18px;
-}
-.badge {
-  display:inline-block;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-weight: 700;
-  font-size: 12px;
-  border: 1px solid rgba(0,0,0,0.08);
-}
-.badge-go { background: rgba(34,197,94,0.15); color:#166534; }
-.badge-caution { background: rgba(234,179,8,0.18); color:#854d0e; }
-.badge-nogo { background: rgba(239,68,68,0.14); color:#7f1d1d; }
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-  background: rgba(255,255,255,0.80);
-  border-right: 1px solid rgba(15, 23, 42, 0.08);
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("Cash Sales Velocity — Pricing Decision Engine")
-st.caption("Choose a cash list price that maximizes the probability of selling fast (≤30 / ≤60 days) while staying profitable and increasing compounding cycles.")
-
-# =========================
-# 1) Put Google Drive SHARE LINKS here (hard-coded)
-# =========================
+# ============================================================
+# CONFIG (put your Drive share links here — no sidebar pasting)
+# ============================================================
 CAL30_LINK = "https://drive.google.com/file/d/1LmJ1Av5CEvMsJ4I85DrpxCeXO0tc4dN4/view?usp=sharing"
 CAL60_LINK = "https://drive.google.com/file/d/1U6IfGFEAtOQXI0tHtAcWDHGM3p29eqjf/view?usp=sharing"
 FEATURES_LINK = "https://drive.google.com/file/d/1H6hkyzbfe4aGkpWH4y8FJgcLp_kYLSo2/view?usp=sharing"
 
+# This is only for dropdown options (county/city) and optional “typical” stats.
+# If you don’t want any dataset in the app, you can remove this and use text inputs instead.
+DATA_PATH = "ai_stats_clean_for_velocity.csv"
+
+# ============================================================
+# PAGE
+# ============================================================
+st.set_page_config(page_title="Cash Sales Velocity — Pricing Decision", layout="wide")
+
+# Premium-ish CSS (client-facing look)
+st.markdown(
+    """
+<style>
+/* Background */
+.stApp {
+  background: radial-gradient(1200px 600px at 20% -10%, rgba(99,102,241,0.18), transparent 55%),
+              radial-gradient(1200px 600px at 85% 0%, rgba(14,165,233,0.14), transparent 55%),
+              linear-gradient(180deg, #fbfdff 0%, #f6f8ff 55%, #fbfdff 100%);
+}
+
+/* Title spacing */
+.block-container { padding-top: 1.1rem; padding-bottom: 1.5rem; }
+
+/* Metric cards */
+[data-testid="stMetric"] {
+  background: rgba(255,255,255,0.72);
+  border: 1px solid rgba(15,23,42,0.08);
+  padding: 14px 14px;
+  border-radius: 16px;
+  box-shadow: 0 10px 25px rgba(2,6,23,0.06);
+}
+
+/* Dataframe container */
+[data-testid="stDataFrame"] {
+  background: rgba(255,255,255,0.72);
+  border-radius: 16px;
+  border: 1px solid rgba(15,23,42,0.08);
+  box-shadow: 0 10px 25px rgba(2,6,23,0.06);
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+  background: rgba(255,255,255,0.72);
+  border: 1px solid rgba(15,23,42,0.08);
+  border-radius: 14px;
+}
+</style>
+""",
+    unsafe_allow_html=True
+)
+
+st.title("Cash Sales Velocity — Pricing Decision Dashboard")
+st.caption(
+    "Goal: pick a cash list price ceiling that maximizes **probability of selling fast (≤30 / ≤60 days)** while staying profitable and increasing compounding cycles."
+)
+
+# ============================================================
+# HELPERS — Drive download
+# ============================================================
 def extract_file_id(url: str) -> str:
     m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"id=([a-zA-Z0-9_-]+)", url)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     raise ValueError(f"Could not extract file id from: {url}")
 
 CAL30_ID = extract_file_id(CAL30_LINK)
@@ -86,7 +99,7 @@ def gdrive_download(file_id: str, out_path: str):
     r = s.get(URL, params={"id": file_id}, stream=True)
     r.raise_for_status()
 
-    # If HTML returned -> confirm token or permissions issue
+    # If HTML returned => token confirm or permissions issue
     if "text/html" in (r.headers.get("Content-Type", "")):
         token = None
         for k, v in r.cookies.items():
@@ -97,7 +110,10 @@ def gdrive_download(file_id: str, out_path: str):
             r = s.get(URL, params={"id": file_id, "confirm": token}, stream=True)
             r.raise_for_status()
         else:
-            raise RuntimeError("Google Drive returned HTML. Fix sharing: Anyone with link → Viewer.")
+            raise RuntimeError(
+                "Google Drive returned HTML (permissions issue). "
+                "Set sharing to: Anyone with link → Viewer."
+            )
 
     with open(out_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -106,130 +122,132 @@ def gdrive_download(file_id: str, out_path: str):
 
 @st.cache_resource
 def load_models():
-    with st.spinner("Loading pricing models..."):
-        gdrive_download(CAL30_ID, CAL30_PATH)
-        gdrive_download(CAL60_ID, CAL60_PATH)
-        gdrive_download(FEATURES_ID, FEATURES_PATH)
+    gdrive_download(CAL30_ID, CAL30_PATH)
+    gdrive_download(CAL60_ID, CAL60_PATH)
+    gdrive_download(FEATURES_ID, FEATURES_PATH)
 
-        cal30 = joblib.load(CAL30_PATH)
-        cal60 = joblib.load(CAL60_PATH)
+    cal30 = joblib.load(CAL30_PATH)
+    cal60 = joblib.load(CAL60_PATH)
 
-        with open(FEATURES_PATH, "r") as f:
-            meta = json.load(f)
-        FEATURES = meta["features"] if isinstance(meta, dict) and "features" in meta else meta
+    with open(FEATURES_PATH, "r") as f:
+        meta = json.load(f)
+    FEATURES = meta["features"] if isinstance(meta, dict) and "features" in meta else meta
 
     return cal30, cal60, FEATURES
 
 cal30, cal60, FEATURES = load_models()
 
-# =========================
-# 2) Sidebar (CLIENT inputs only)
-# =========================
+# ============================================================
+# DATA FOR DROPDOWNS (County/City)
+# ============================================================
+@st.cache_data
+def load_location_options(data_path: str):
+    if not os.path.exists(data_path):
+        # If you didn't ship the dataset, return empty lists (fallback)
+        return [], [], None
+
+    df = pd.read_csv(data_path)
+    # Expecting these columns from your training renames
+    # If your CSV still has "County, State" and "Property Location or City",
+    # update here accordingly.
+    possible_county_cols = ["county_state", "County, State"]
+    possible_city_cols = ["city", "Property Location or City"]
+
+    county_col = next((c for c in possible_county_cols if c in df.columns), None)
+    city_col = next((c for c in possible_city_cols if c in df.columns), None)
+
+    if county_col is None or city_col is None:
+        return [], [], None
+
+    df[county_col] = df[county_col].astype("string")
+    df[city_col] = df[city_col].astype("string")
+
+    counties = sorted(df[county_col].dropna().unique().tolist())
+    cities = sorted(df[city_col].dropna().unique().tolist())
+    return counties, cities, (df, county_col, city_col)
+
+counties, cities, loc_pack = load_location_options(DATA_PATH)
+
+# ============================================================
+# SIDEBAR INPUTS (business inputs only)
+# ============================================================
 st.sidebar.header("Deal Inputs")
 
-# Load dataset for dropdown options
-@st.cache_data
-def load_location_options():
-    df = pd.read_csv("ai_stats_clean_for_velocity.csv")
+# County/City dropdowns (preferred)
+if loc_pack is not None and len(counties) > 0:
+    loc_df, county_col, city_col = loc_pack
 
-    counties = sorted(df["county_state"].dropna().unique())
-    cities = sorted(df["city"].dropna().unique())
+    county_state = st.sidebar.selectbox("County, State", counties, index=0)
 
-    return counties, cities, df
+    filtered_cities = sorted(
+        loc_df.loc[loc_df[county_col] == county_state, city_col]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    if len(filtered_cities) == 0:
+        filtered_cities = cities
 
-counties, cities, loc_df = load_location_options()
+    city = st.sidebar.selectbox("City", filtered_cities, index=0)
 
-county_state = st.sidebar.selectbox(
-    "County, State",
-    counties,
-    index=0
-)
+else:
+    # Fallback if dataset not present
+    st.sidebar.info("Dropdowns disabled (dataset not found). Using manual inputs.")
+    county_state = st.sidebar.text_input("County, State", value="Los Angeles, CA")
+    city = st.sidebar.text_input("City", value="Lancaster")
 
-# Filter cities by county (better UX)
-filtered_cities = sorted(
-    loc_df[loc_df["county_state"] == county_state]["city"]
-    .dropna()
-    .unique()
-)
-
-if len(filtered_cities) == 0:
-    filtered_cities = cities
-
-city = st.sidebar.selectbox("City", filtered_cities)
 acres = st.sidebar.number_input("Acres", min_value=0.0, value=2.5, step=0.1)
 total_cost = st.sidebar.number_input("Total Purchase Price (All-in)", min_value=1.0, value=6000.0, step=100.0)
 
 st.sidebar.divider()
-st.sidebar.subheader("Sell-fast target")
+st.sidebar.subheader("Speed target")
 
-mode = st.sidebar.radio("Target window", ["≤30 days", "≤60 days"], index=1)
-target_prob = st.sidebar.slider("Minimum probability target", 0.40, 0.95, 0.70, 0.01)
+mode = st.sidebar.radio("Target window", ["≤30 days", "≤60 days"], index=0)
+target_prob = st.sidebar.slider("Target probability", 0.30, 0.95, 0.70, 0.01)
 
 st.sidebar.divider()
-st.sidebar.subheader("Scan pricing range")
+st.sidebar.subheader("Pricing scan range")
 
-m_min = st.sidebar.number_input("Min markup multiple", min_value=0.5, value=1.2, step=0.1)
-m_max = st.sidebar.number_input("Max markup multiple", min_value=0.6, value=6.0, step=0.1)
+m_min = st.sidebar.number_input("Min multiple", min_value=0.5, value=1.0, step=0.1)
+m_max = st.sidebar.number_input("Max multiple", min_value=0.6, value=8.0, step=0.1)
 m_step = st.sidebar.number_input("Step", min_value=0.05, value=0.1, step=0.05)
 
-st.sidebar.divider()
-st.sidebar.subheader("Commission assumptions")
-AFFILIATE_PCT_SALE = st.sidebar.number_input("Affiliate/List commission (% of sale)", min_value=0.0, max_value=0.5, value=0.10, step=0.01)
-AGENT_PCT_PROFIT = st.sidebar.number_input("Agents total (% of profit)", min_value=0.0, max_value=0.5, value=0.08, step=0.01)
+# ============================================================
+# FINANCIAL ASSUMPTIONS (client-friendly)
+# ============================================================
+with st.sidebar.expander("Assumptions (commissions)"):
+    AFFILIATE_PCT_SALE = st.number_input("Affiliate / Listing (% of Sale)", min_value=0.0, max_value=0.30, value=0.10, step=0.01)
+    AGENT_PCT_PROFIT = st.number_input("Agents Total (% of Profit) (4%+4%)", min_value=0.0, max_value=0.30, value=0.08, step=0.01)
 
-# =========================
-# 3) Finance helpers
-# =========================
 def estimate_net_profit(sale_price: float, total_cost: float) -> float:
     affiliate = AFFILIATE_PCT_SALE * sale_price
     profit_before_agents = sale_price - total_cost - affiliate
-    agent_comm = AGENT_PCT_PROFIT * max(profit_before_agents, 0)
-    return profit_before_agents - agent_comm
+    agent_comm = AGENT_PCT_PROFIT * max(profit_before_agents, 0.0)
+    net_profit = profit_before_agents - agent_comm
+    return net_profit
 
-# =========================
-# 4) Feature building (handles common training schemas)
-# =========================
-def stable_hash_to_int(s: str, mod: int = 10_000_000) -> int:
-    if s is None: s = ""
-    h = hashlib.md5(s.encode("utf-8")).hexdigest()
-    return int(h[:8], 16) % mod
-
+# ============================================================
+# MODEL FEATURE ROWS (must match training feature names)
+# ============================================================
 def make_feature_row(multiple: float) -> dict:
-    row = {
+    return {
         "multiple": float(multiple),
         "total_cost": float(total_cost),
         "acres": float(acres),
         "county_state": str(county_state),
         "city": str(city),
-        "county_state_hash": stable_hash_to_int(str(county_state)),
-        "city_hash": stable_hash_to_int(str(city)),
     }
-    return row
 
 multiples = np.arange(m_min, m_max + 1e-9, m_step)
-X_raw = pd.DataFrame([make_feature_row(m) for m in multiples])
+X = pd.DataFrame([make_feature_row(m) for m in multiples])
 
 # Ensure all expected features exist
 for col in FEATURES:
-    if col not in X_raw.columns:
-        X_raw[col] = np.nan
+    if col not in X.columns:
+        X[col] = np.nan
+X = X[FEATURES].copy()
 
-X = X_raw[FEATURES].copy()
-
-# Coerce types safely
-for c in X.columns:
-    # If the model expects numeric-only, force numeric where possible
-    if X[c].dtype == "object":
-        # Try numeric first, else hash
-        tmp = pd.to_numeric(X[c], errors="coerce")
-        if tmp.notna().any():
-            X[c] = tmp
-        else:
-            X[c] = X[c].astype(str).apply(lambda v: stable_hash_to_int(v)).astype(float)
-
-# =========================
-# 5) Predict probabilities
-# =========================
+# Predict probabilities
 p30 = cal30.predict_proba(X)[:, 1]
 p60 = cal60.predict_proba(X)[:, 1]
 
@@ -241,21 +259,24 @@ pred = pd.DataFrame({
 })
 
 pred["net_profit"] = pred["sale_price"].apply(lambda s: estimate_net_profit(float(s), float(total_cost)))
-pred["net_roi"] = pred["net_profit"] / float(total_cost)
+pred["net_roi"] = np.where(float(total_cost) > 0, pred["net_profit"] / float(total_cost), np.nan)
 
-# Compounding proxy:
-# expected cycles/year ≈ probability * (365/target_days)
-target_days = 30 if mode == "≤30 days" else 60
-use_prob_col = "P_sell_30d" if mode == "≤30 days" else "P_sell_60d"
-pred["cycles_year_proxy"] = pred[use_prob_col] * (365.0 / target_days)
+# ============================================================
+# DECISION LOGIC
+# ============================================================
+if mode == "≤30 days":
+    use_prob_col = "P_sell_30d"
+    days_label = "≤30d"
+    target_days = 30
+else:
+    use_prob_col = "P_sell_60d"
+    days_label = "≤60d"
+    target_days = 60
 
-# =========================
-# 6) Decision logic (client-friendly)
-# =========================
-feasible = pred[pred[use_prob_col] >= target_prob].copy()
+feasible = pred[(pred[use_prob_col] >= target_prob)].copy()
 rec = feasible.sort_values("multiple").iloc[-1] if len(feasible) else None
 
-def decision_label(prob):
+def decision_label(prob: float) -> str:
     if prob >= target_prob:
         return "GO"
     if prob >= max(0.50, target_prob - 0.10):
@@ -264,122 +285,126 @@ def decision_label(prob):
 
 pred["decision"] = pred[use_prob_col].apply(decision_label)
 
-def decision_badge(x: str) -> str:
-    if x == "GO":
-        return '<span class="badge badge-go">GO</span>'
-    if x == "CAUTION":
-        return '<span class="badge badge-caution">CAUTION</span>'
-    return '<span class="badge badge-nogo">NO-GO</span>'
-
-# =========================
-# 7) Executive summary (TOP section)
-# =========================
-st.markdown('<div class="card">', unsafe_allow_html=True)
+# ============================================================
+# HEADER: CLIENT-FACING DECISION OUTPUT
+# ============================================================
 st.subheader("Recommended price ceiling (decision output)")
 
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5 = st.columns(5)
 
 if rec is None:
     k1.metric("Recommended max multiple", "—")
     k2.metric("Recommended list price", "—")
-    k3.metric(f"P(sell {mode})", "—")
-    k4.metric("Est. net profit", "—")
+    k3.metric(f"P(sell {days_label})", "—")
+    k4.metric("Est. net profit (after commissions)", "—")
     k5.metric("Est. net ROI", "—")
-    k6.metric("Cycles/year (proxy)", "—")
-
     st.warning(
-        f"No price in your scan meets target **P(sell {mode}) ≥ {target_prob:.0%}**.\n\n"
-        "Try one of these:\n"
-        "• scan **lower multiples** (reduce price)\n"
-        "• lower the probability target a bit (e.g., 65%)\n"
-        "• widen scan range (e.g., start from 1.0x)"
+        f"No price in your scan meets target **P(sell {days_label}) ≥ {target_prob:.0%}**. "
+        f"Try scanning lower multiples, lowering target probability, or switching to the {('≤60 days' if mode=='≤30 days' else '≤30 days')} window."
     )
 else:
     k1.metric("Recommended max multiple", f"{rec['multiple']:.2f}x")
     k2.metric("Recommended list price", f"${rec['sale_price']:,.0f}")
-    k3.metric(f"P(sell {mode})", f"{rec[use_prob_col]:.0%}")
-    k4.metric("Est. net profit", f"${rec['net_profit']:,.0f}")
+    k3.metric(f"P(sell {days_label})", f"{rec[use_prob_col]:.0%}")
+    k4.metric("Est. net profit (after commissions)", f"${rec['net_profit']:,.0f}")
     k5.metric("Est. net ROI", f"{rec['net_roi']:.0%}")
-    k6.metric("Cycles/year (proxy)", f"{rec['cycles_year_proxy']:.2f}")
 
 st.caption(
-    f"Rule used: choose the **highest** multiple that still keeps **P(sell {mode}) ≥ {target_prob:.0%}** — maximizing price while protecting velocity."
+    f"Decision rule: choose the **highest** multiple that still achieves **P(sell {days_label}) ≥ {target_prob:.0%}**. "
+    "This maximizes price while protecting velocity/compounding."
 )
-st.markdown('</div>', unsafe_allow_html=True)
 
-st.write("")
+st.divider()
 
-# =========================
-# 8) Charts (client interpretable)
-# =========================
+# ============================================================
+# CHARTS (clean + interpretable)
+# ============================================================
 c1, c2 = st.columns(2)
 
 with c1:
     fig = px.line(
         pred, x="multiple", y=use_prob_col,
-        markers=True,
-        title=f"Probability of selling {mode} vs markup multiple"
+        title=f"Probability of selling {days_label} vs markup multiple"
     )
     fig.update_yaxes(range=[0, 1])
-    fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
 with c2:
     fig = px.line(
         pred, x="multiple", y="net_profit",
-        markers=True,
         title="Estimated net profit vs markup multiple (after commissions)"
     )
-    fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-# =========================
-# 9) Decision table (GO/CAUTION/NO-GO)
-# =========================
-st.markdown('<div class="card">', unsafe_allow_html=True)
+# Optional: “tradeoff curve” in one chart
+st.markdown("### Speed vs Profit tradeoff")
+trade = pred.copy()
+trade["prob_target_window"] = trade[use_prob_col]
+fig = px.scatter(
+    trade,
+    x="net_profit",
+    y="prob_target_window",
+    color="decision",
+    hover_data=["multiple", "sale_price", "net_roi", "P_sell_30d", "P_sell_60d"],
+    labels={"net_profit": "Net Profit ($)", "prob_target_window": f"P(sell {days_label})"},
+    title="Pick a point that balances speed (probability) and profit"
+)
+fig.update_yaxes(range=[0, 1])
+st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# DECISION TABLE (client-facing)
+# ============================================================
 st.subheader("Pricing options (decision table)")
 
 show = pred.copy()
-show["sale_price"] = show["sale_price"].round(0)
 show["P_sell_30d"] = (show["P_sell_30d"] * 100).round(1)
 show["P_sell_60d"] = (show["P_sell_60d"] * 100).round(1)
 show["net_profit"] = show["net_profit"].round(0)
 show["net_roi"] = (show["net_roi"] * 100).round(1)
-show["cycles_year_proxy"] = show["cycles_year_proxy"].round(2)
+show["sale_price"] = show["sale_price"].round(0)
 
-# Make a clean table for client
-client_table = show[["multiple","sale_price","decision","P_sell_30d","P_sell_60d","net_profit","net_roi","cycles_year_proxy"]].copy()
-client_table = client_table.rename(columns={
-    "sale_price":"list_price",
-    "net_profit":"est_net_profit",
-    "net_roi":"est_net_roi_%"
-})
-
-st.dataframe(client_table, use_container_width=True, hide_index=True)
+# Show top rows around recommended point for readability
+if rec is not None:
+    rec_idx = int(np.argmin(np.abs(show["multiple"].values - float(rec["multiple"]))))
+    start = max(0, rec_idx - 10)
+    end = min(len(show), rec_idx + 15)
+    st.dataframe(
+        show.iloc[start:end][["multiple","sale_price","decision","P_sell_30d","P_sell_60d","net_profit","net_roi"]],
+        use_container_width=True
+    )
+else:
+    st.dataframe(
+        show[["multiple","sale_price","decision","P_sell_30d","P_sell_60d","net_profit","net_roi"]].head(40),
+        use_container_width=True
+    )
 
 st.download_button(
-    "Download decision scan CSV",
+    "Download pricing scan CSV",
     data=pred.to_csv(index=False).encode("utf-8"),
     file_name="pricing_decision_scan.csv",
     mime="text/csv",
 )
 
-with st.expander("How to read this (simple)"):
-    st.markdown(f"""
-- **multiple** = Sale Price / Total Cost  
-- **P(sell {mode})** is the model’s estimate you sell within the target window  
-- **Recommended ceiling** = highest multiple that still meets your probability target  
-- **Cycles/year (proxy)** = probability × (365 / target_days)  
-  - Higher cycles/year means faster redeployment / more compounding
-""")
+with st.expander("How to read this (client-friendly)"):
+    st.markdown(
+        f"""
+**What this dashboard does**
+- You enter the deal context (**county/city/acres/total cost**).
+- We scan price points as **multiples** (Sale Price / Total Cost).
+- For each multiple we estimate:
+  - **P(sell {days_label})** (speed/velocity)
+  - **Net profit** after commissions (10% of sale + 8% of profit by default)
+  - **Net ROI**
 
-st.markdown('</div>', unsafe_allow_html=True)
+**Recommended price ceiling**
+- The app chooses the **highest** multiple that still meets your speed requirement:
+  - **P(sell {days_label}) ≥ {target_prob:.0%}**
+- That’s your “max list price” that still preserves fast compounding cycles.
 
-# -----------------------------
-# Safety check (optional, hidden-ish)
-# -----------------------------
-# If curve is totally flat, it usually means the model isn't "seeing" the multiple feature.
-# We don't show this to the client; we show as a subtle note only to operator.
-flat_check = np.std(pred[use_prob_col].values)
-if flat_check < 1e-6:
-    st.info("Operator note: Probability curve is flat. This usually means the model feature schema differs from this app. Confirm your FEATURES match training.")
+**GO / CAUTION / NO-GO**
+- **GO**: meets your target probability.
+- **CAUTION**: close to target (within ~10 points).
+- **NO-GO**: likely too slow.
+"""
+    )
