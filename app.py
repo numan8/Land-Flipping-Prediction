@@ -156,7 +156,6 @@ if len(filtered_cities) == 0:
     filtered_cities = cities
 
 city = st.sidebar.selectbox("City", filtered_cities)
-
 acres = st.sidebar.number_input("Acres", min_value=0.0, value=2.5, step=0.1)
 total_cost = st.sidebar.number_input("Total Purchase Price (All-in)", min_value=1.0, value=6000.0, step=100.0)
 
