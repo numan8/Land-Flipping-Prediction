@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 import joblib
@@ -12,12 +13,27 @@ st.title("Cash Sales Velocity — Prediction Dashboard")
 st.caption("Loads trained models from Google Drive, then predicts P(sell ≤30d) and P(sell ≤60d).")
 
 # =========================
-# 1) Put your Google Drive file IDs here
+# 1) Paste Google Drive SHARE LINKS here (as you already did)
 # =========================
-CAL30_FILE_ID = "https://drive.google.com/file/d/1LmJ1Av5CEvMsJ4I85DrpxCeXO0tc4dN4/view?usp=sharing"
-CAL60_FILE_ID = "https://drive.google.com/file/d/1U6IfGFEAtOQXI0tHtAcWDHGM3p29eqjf/view?usp=sharing"
-FEATURES_FILE_ID = "https://drive.google.com/file/d/1H6hkyzbfe4aGkpWH4y8FJgcLp_kYLSo2/view?usp=sharing"
-REPORT_FILE_ID = "https://drive.google.com/file/d/1qBhw9MOxImlkEIl7opsMn9xPf-17_n6s/view?usp=sharing"
+CAL30_LINK = "https://drive.google.com/file/d/1LmJ1Av5CEvMsJ4I85DrpxCeXO0tc4dN4/view?usp=sharing"
+CAL60_LINK = "https://drive.google.com/file/d/1U6IfGFEAtOQXI0tHtAcWDHGM3p29eqjf/view?usp=sharing"
+FEATURES_LINK = "https://drive.google.com/file/d/1H6hkyzbfe4aGkpWH4y8FJgcLp_kYLSo2/view?usp=sharing"
+REPORT_LINK = "https://drive.google.com/file/d/1qBhw9MOxImlkEIl7opsMn9xPf-17_n6s/view?usp=sharing"
+
+def extract_file_id(gdrive_url: str) -> str:
+    # Works for /file/d/<id>/... and also uc?id=<id>
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", gdrive_url)
+    if m:
+        return m.group(1)
+    m = re.search(r"id=([a-zA-Z0-9_-]+)", gdrive_url)
+    if m:
+        return m.group(1)
+    raise ValueError(f"Could not extract file id from: {gdrive_url}")
+
+CAL30_FILE_ID = extract_file_id(CAL30_LINK)
+CAL60_FILE_ID = extract_file_id(CAL60_LINK)
+FEATURES_FILE_ID = extract_file_id(FEATURES_LINK)
+REPORT_FILE_ID = extract_file_id(REPORT_LINK)
 
 ART_DIR = "artifacts"
 CAL30_PATH = os.path.join(ART_DIR, "cal30.pkl")
@@ -25,48 +41,59 @@ CAL60_PATH = os.path.join(ART_DIR, "cal60.pkl")
 FEATURES_PATH = os.path.join(ART_DIR, "features.json")
 REPORT_PATH = os.path.join(ART_DIR, "model_report.json")
 
-def gdrive_direct_url(file_id: str) -> str:
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-def download_from_gdrive(file_id: str, out_path: str):
+def gdrive_download(file_id: str, out_path: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return
 
-    url = gdrive_direct_url(file_id)
-    with requests.Session() as s:
-        r = s.get(url, stream=True)
-        r.raise_for_status()
+    URL = "https://drive.google.com/uc?export=download"
+    session = requests.Session()
 
-        # Handle Google Drive confirmation token for large files
-        token = None
+    r = session.get(URL, params={"id": file_id}, stream=True)
+    r.raise_for_status()
+
+    # If Drive returns HTML, try confirm token
+    if "text/html" in (r.headers.get("Content-Type", "")):
+        confirm = None
         for k, v in r.cookies.items():
             if k.startswith("download_warning"):
-                token = v
+                confirm = v
                 break
-        if token:
-            r = s.get(url + f"&confirm={token}", stream=True)
+        if confirm:
+            r = session.get(URL, params={"id": file_id, "confirm": confirm}, stream=True)
             r.raise_for_status()
+        else:
+            # Not public or blocked
+            raise RuntimeError(
+                "Google Drive returned HTML instead of a file. "
+                "Make sure file is shared as 'Anyone with the link'."
+            )
 
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+    with open(out_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    # sanity check
+    with open(out_path, "rb") as f:
+        head = f.read(200).lower()
+        if b"<html" in head:
+            raise RuntimeError("Downloaded HTML instead of file. Fix Drive sharing permissions.")
 
 @st.cache_resource
 def load_models():
     with st.spinner("Downloading model artifacts from Google Drive..."):
-        download_from_gdrive(CAL30_FILE_ID, CAL30_PATH)
-        download_from_gdrive(CAL60_FILE_ID, CAL60_PATH)
-        download_from_gdrive(FEATURES_FILE_ID, FEATURES_PATH)
-        download_from_gdrive(REPORT_FILE_ID, REPORT_PATH)
+        gdrive_download(CAL30_FILE_ID, CAL30_PATH)
+        gdrive_download(CAL60_FILE_ID, CAL60_PATH)
+        gdrive_download(FEATURES_FILE_ID, FEATURES_PATH)
+        gdrive_download(REPORT_FILE_ID, REPORT_PATH)
 
     cal30 = joblib.load(CAL30_PATH)
     cal60 = joblib.load(CAL60_PATH)
 
     with open(FEATURES_PATH, "r") as f:
         meta = json.load(f)
-    features = meta["features"] if isinstance(meta, dict) and "features" in meta else meta
+    FEATURES = meta["features"] if isinstance(meta, dict) and "features" in meta else meta
 
     report = {}
     try:
@@ -75,7 +102,7 @@ def load_models():
     except Exception:
         pass
 
-    return cal30, cal60, features, report
+    return cal30, cal60, FEATURES, report
 
 cal30, cal60, FEATURES, report = load_models()
 
@@ -97,40 +124,24 @@ target_p60 = st.sidebar.slider("Target P(sell ≤60d)", 0.0, 1.0, 0.70, 0.01)
 target_p30 = st.sidebar.slider("Target P(sell ≤30d)", 0.0, 1.0, 0.60, 0.01)
 enforce_30 = st.sidebar.checkbox("Also enforce ≤30d target", value=False)
 
-# =========================
-# 3) Build features EXACTLY as training expects
-#    IMPORTANT: This assumes your training used these feature names.
-#    If your FEATURES include other columns, we must create them here too.
-# =========================
 def make_feature_row(multiple: float):
-    # Minimal safe defaults
-    row = {
+    return {
         "multiple": float(multiple),
         "total_cost": float(total_cost),
         "acres": float(acres),
         "county_state": str(county_state),
         "city": str(city),
     }
-    return row
 
 multiples = np.arange(m_min, m_max + 1e-9, m_step)
 X_new = pd.DataFrame([make_feature_row(m) for m in multiples])
 
-# Ensure ALL expected features exist
+# Ensure expected features exist
 for col in FEATURES:
     if col not in X_new.columns:
         X_new[col] = np.nan
-
 X_new = X_new[FEATURES].copy()
 
-# If your model expects numeric-only, coerce where possible
-for c in X_new.columns:
-    if X_new[c].dtype == "object":
-        X_new[c] = X_new[c].astype("string")
-
-# =========================
-# 4) Predict
-# =========================
 p30 = cal30.predict_proba(X_new)[:, 1]
 p60 = cal60.predict_proba(X_new)[:, 1]
 
@@ -141,7 +152,6 @@ pred = pd.DataFrame({
     "P_sell_60d": p60,
 })
 
-# Recommendation
 mask = pred["P_sell_60d"] >= target_p60
 if enforce_30:
     mask &= pred["P_sell_30d"] >= target_p30
@@ -149,17 +159,12 @@ if enforce_30:
 feasible = pred[mask]
 rec = feasible.sort_values("multiple").iloc[-1] if len(feasible) else None
 
-# =========================
-# 5) Output
-# =========================
 st.subheader("Model report (from training)")
 if report:
     st.json(report)
-else:
-    st.info("No report loaded (optional).")
 
 if rec is None:
-    st.warning("No multiple in your scan meets the selected probability target(s). Try lowering targets or scanning lower multiples.")
+    st.warning("No multiple meets selected probability target(s). Lower targets or scan lower multiples.")
 else:
     st.success(
         f"Recommended MAX multiple: **{rec['multiple']:.2f}x** "
