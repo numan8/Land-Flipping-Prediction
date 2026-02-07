@@ -14,10 +14,10 @@ st.caption("Loads trained models from Google Drive, then predicts P(sell ≤30d)
 # =========================
 # 1) Put your Google Drive file IDs here
 # =========================
-CAL30_FILE_ID = "PASTE_CAL30_FILE_ID"
-CAL60_FILE_ID = "PASTE_CAL60_FILE_ID"
-FEATURES_FILE_ID = "PASTE_FEATURES_FILE_ID"
-REPORT_FILE_ID = "PASTE_REPORT_FILE_ID"
+CAL30_FILE_ID = "https://drive.google.com/file/d/1LmJ1Av5CEvMsJ4I85DrpxCeXO0tc4dN4/view?usp=sharing"
+CAL60_FILE_ID = "https://drive.google.com/file/d/1U6IfGFEAtOQXI0tHtAcWDHGM3p29eqjf/view?usp=sharing"
+FEATURES_FILE_ID = "https://drive.google.com/file/d/1H6hkyzbfe4aGkpWH4y8FJgcLp_kYLSo2/view?usp=sharing"
+REPORT_FILE_ID = "https://drive.google.com/file/d/1qBhw9MOxImlkEIl7opsMn9xPf-17_n6s/view?usp=sharing"
 
 ART_DIR = "artifacts"
 CAL30_PATH = os.path.join(ART_DIR, "cal30.pkl")
