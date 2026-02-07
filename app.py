@@ -127,8 +127,36 @@ cal30, cal60, FEATURES = load_models()
 # =========================
 st.sidebar.header("Deal Inputs")
 
-county_state = st.sidebar.text_input("County, State", value="Los Angeles, CA")
-city = st.sidebar.text_input("City", value="Lancaster")
+# Load dataset for dropdown options
+@st.cache_data
+def load_location_options():
+    df = pd.read_csv("ai_stats_clean_for_velocity.csv")
+
+    counties = sorted(df["county_state"].dropna().unique())
+    cities = sorted(df["city"].dropna().unique())
+
+    return counties, cities, df
+
+counties, cities, loc_df = load_location_options()
+
+county_state = st.sidebar.selectbox(
+    "County, State",
+    counties,
+    index=0
+)
+
+# Filter cities by county (better UX)
+filtered_cities = sorted(
+    loc_df[loc_df["county_state"] == county_state]["city"]
+    .dropna()
+    .unique()
+)
+
+if len(filtered_cities) == 0:
+    filtered_cities = cities
+
+city = st.sidebar.selectbox("City", filtered_cities)
+
 acres = st.sidebar.number_input("Acres", min_value=0.0, value=2.5, step=0.1)
 total_cost = st.sidebar.number_input("Total Purchase Price (All-in)", min_value=1.0, value=6000.0, step=100.0)
 
